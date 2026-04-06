@@ -779,6 +779,10 @@ impl<T: TransactionOrdering> TxPool<T> {
         // block is processed, so on_chain_nonce can be stale. Overwriting
         // sender_info with a stale nonce causes transactions to be incorrectly
         // placed in the queued pool (the pool sees a nonce gap that doesn't exist).
+        //
+        // We also use the best known nonce for insert_tx so the tx's initial
+        // TxState flags are calculated against the current state, not the stale one.
+        let effective_on_chain_nonce;
         self.all_transactions
             .sender_info
             .entry(tx.sender_id())
@@ -793,8 +797,6 @@ impl<T: TransactionOrdering> TxPool<T> {
                         incoming_nonce = on_chain_nonce,
                         "rejecting sender_info nonce regression during tx insertion"
                     );
-                    // Still update balance — it can legitimately decrease (e.g., received ETH
-                    // was spent in a later block) but nonce can only go forward.
                     info.balance = on_chain_balance;
                 }
             })
@@ -802,8 +804,13 @@ impl<T: TransactionOrdering> TxPool<T> {
                 state_nonce: on_chain_nonce,
                 balance: on_chain_balance,
             });
+        effective_on_chain_nonce = self
+            .all_transactions
+            .sender_info
+            .get(&tx.sender_id())
+            .map_or(on_chain_nonce, |info| info.state_nonce);
 
-        match self.all_transactions.insert_tx(tx, on_chain_balance, on_chain_nonce) {
+        match self.all_transactions.insert_tx(tx, on_chain_balance, effective_on_chain_nonce) {
             Ok(InsertOk { transaction, move_to, replaced_tx, updates, state }) => {
                 // replace the new tx and remove the replaced in the subpool(s)
                 self.add_new_transaction(transaction.clone(), replaced_tx.clone(), move_to);
