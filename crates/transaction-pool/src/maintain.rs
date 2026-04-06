@@ -176,6 +176,9 @@ pub async fn maintain_transaction_pool<N, Client, P, St, Tasks>(
     // the future that reloads accounts from state
     let mut reload_accounts_fut = Fuse::terminated();
 
+    // the block hash at which the current reload was initiated, used to detect stale results
+    let mut reload_accounts_block_hash = BlockHash::ZERO;
+
     // eviction interval for stale non local txs
     let mut stale_eviction_interval = time::interval(config.max_tx_lifetime);
 
@@ -229,6 +232,7 @@ pub async fn maintain_transaction_pool<N, Client, P, St, Tasks>(
                 .boxed()
             };
             reload_accounts_fut = rx.fuse();
+            reload_accounts_block_hash = at;
             task_spawner.spawn_blocking_task(fut);
         }
 
@@ -301,8 +305,25 @@ pub async fn maintain_transaction_pool<N, Client, P, St, Tasks>(
                 // reloaded accounts successfully
                 // extend accounts we failed to load from database
                 dirty_addresses.extend(failed_to_load);
-                // update the pool with the loaded accounts
-                pool.update_accounts(accounts);
+
+                // If the pool has advanced to a new block since the reload was
+                // initiated, the loaded state is stale and must not overwrite the
+                // fresher state applied by on_canonical_state_change. Re-dirty the
+                // accounts so they are reloaded at the correct block.
+                let current_block_hash = pool.block_info().last_seen_block_hash;
+                if current_block_hash == reload_accounts_block_hash {
+                    pool.update_accounts(accounts);
+                } else {
+                    let num_accounts = accounts.len();
+                    warn!(
+                        target: "txpool",
+                        num_accounts,
+                        reload_block_hash = %reload_accounts_block_hash,
+                        current_block_hash = %current_block_hash,
+                        "discarding stale dirty-account reload: pool advanced while loading, re-dirtying accounts"
+                    );
+                    dirty_addresses.extend(accounts.into_iter().map(|acc| acc.address));
+                }
             }
             Some(Ok(Err(res))) => {
                 // Failed to load accounts from state
