@@ -635,8 +635,29 @@ impl<T: TransactionOrdering> TxPool<T> {
         // Apply the state changes to the total set of transactions which triggers sub-pool updates.
         let updates = self.all_transactions.update(&changed_senders);
 
-        // track changed accounts
-        self.all_transactions.sender_info.extend(changed_senders);
+        // track changed accounts — only advance nonces, never regress
+        for (sender_id, new_info) in changed_senders {
+            match self.all_transactions.sender_info.entry(sender_id) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let existing = entry.get_mut();
+                    if new_info.state_nonce >= existing.state_nonce {
+                        *existing = new_info;
+                    } else {
+                        warn!(
+                            target: "txpool",
+                            ?sender_id,
+                            existing_nonce = existing.state_nonce,
+                            incoming_nonce = new_info.state_nonce,
+                            "rejecting sender_info nonce regression during account update"
+                        );
+                        existing.balance = new_info.balance;
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(new_info);
+                }
+            }
+        }
 
         // Process the sub-pool updates
         let update = self.process_updates(updates);
@@ -753,12 +774,34 @@ impl<T: TransactionOrdering> TxPool<T> {
 
         self.validate_auth(&tx, on_chain_nonce, on_chain_code_hash)?;
 
-        // Update sender info with balance and nonce
+        // Update sender info with balance and nonce, but never regress the nonce.
+        // Validation runs on a separate task and may read state before the latest
+        // block is processed, so on_chain_nonce can be stale. Overwriting
+        // sender_info with a stale nonce causes transactions to be incorrectly
+        // placed in the queued pool (the pool sees a nonce gap that doesn't exist).
         self.all_transactions
             .sender_info
             .entry(tx.sender_id())
-            .or_default()
-            .update(on_chain_nonce, on_chain_balance);
+            .and_modify(|info| {
+                if on_chain_nonce >= info.state_nonce {
+                    info.update(on_chain_nonce, on_chain_balance);
+                } else {
+                    warn!(
+                        target: "txpool",
+                        sender = %tx.transaction.sender(),
+                        existing_nonce = info.state_nonce,
+                        incoming_nonce = on_chain_nonce,
+                        "rejecting sender_info nonce regression during tx insertion"
+                    );
+                    // Still update balance — it can legitimately decrease (e.g., received ETH
+                    // was spent in a later block) but nonce can only go forward.
+                    info.balance = on_chain_balance;
+                }
+            })
+            .or_insert_with(|| SenderInfo {
+                state_nonce: on_chain_nonce,
+                balance: on_chain_balance,
+            });
 
         match self.all_transactions.insert_tx(tx, on_chain_balance, on_chain_nonce) {
             Ok(InsertOk { transaction, move_to, replaced_tx, updates, state }) => {
