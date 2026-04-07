@@ -21,9 +21,12 @@ use crate::{
     PoolConfig, PoolResult, PoolTransaction, PoolUpdateKind, PriceBumpConfig, TransactionOrdering,
     ValidPoolTransaction, U256,
 };
-use alloy_consensus::constants::{
-    EIP1559_TX_TYPE_ID, EIP2930_TX_TYPE_ID, EIP4844_TX_TYPE_ID, EIP7702_TX_TYPE_ID, KECCAK_EMPTY,
-    LEGACY_TX_TYPE_ID,
+use alloy_consensus::{
+    constants::{
+        EIP1559_TX_TYPE_ID, EIP2930_TX_TYPE_ID, EIP4844_TX_TYPE_ID, EIP7702_TX_TYPE_ID,
+        KECCAK_EMPTY, LEGACY_TX_TYPE_ID,
+    },
+    Transaction,
 };
 use alloy_eips::{
     eip1559::{ETHEREUM_BLOCK_GAS_LIMIT_30M, MIN_PROTOCOL_BASE_FEE},
@@ -628,15 +631,41 @@ impl<T: TransactionOrdering> TxPool<T> {
     }
 
     /// Updates the transactions for the changed senders.
+    ///
+    /// When `authoritative` is true (called from `on_canonical_state_change`), sender_info is
+    /// always updated — including nonce decreases from reorgs. When false (dirty-account reload),
+    /// nonce regression is rejected to prevent stale data from overwriting fresher state.
     pub(crate) fn update_accounts(
         &mut self,
         changed_senders: FxHashMap<SenderId, SenderInfo>,
+        authoritative: bool,
     ) -> UpdateOutcome<T::Transaction> {
         // Apply the state changes to the total set of transactions which triggers sub-pool updates.
         let updates = self.all_transactions.update(&changed_senders);
 
-        // track changed accounts
-        self.all_transactions.sender_info.extend(changed_senders);
+        // Track changed accounts
+        for (sender_id, new_info) in changed_senders {
+            match self.all_transactions.sender_info.entry(sender_id) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let existing = entry.get_mut();
+                    if authoritative || new_info.state_nonce >= existing.state_nonce {
+                        *existing = new_info;
+                    } else {
+                        warn!(
+                            target: "txpool",
+                            ?sender_id,
+                            existing_nonce = existing.state_nonce,
+                            incoming_nonce = new_info.state_nonce,
+                            "rejecting sender_info nonce regression during account update"
+                        );
+                        existing.balance = new_info.balance;
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(new_info);
+                }
+            }
+        }
 
         // Process the sub-pool updates
         let update = self.process_updates(updates);
@@ -677,8 +706,10 @@ impl<T: TransactionOrdering> TxPool<T> {
         let (prev_base_fee, prev_blob_fee) =
             self.update_pending_fees_only(block_info.pending_basefee, block_info.pending_blob_fee);
 
-        // Now update accounts with the new fees already set
-        let mut outcome = self.update_accounts(changed_senders);
+        // Now update accounts with the new fees already set.
+        // Authoritative: this data comes from the canonical chain (including reorgs),
+        // so nonce regression is allowed.
+        let mut outcome = self.update_accounts(changed_senders, true);
 
         // Apply subpool updates based on fee changes
         // This will record any additional promotions based on fee movements
@@ -753,14 +784,48 @@ impl<T: TransactionOrdering> TxPool<T> {
 
         self.validate_auth(&tx, on_chain_nonce, on_chain_code_hash)?;
 
-        // Update sender info with balance and nonce
+        // Update sender info with balance and nonce, but never regress the nonce.
+        // Validation runs on a separate task and may read state before the latest
+        // block is processed, so on_chain_nonce can be stale. Overwriting
+        // sender_info with a stale nonce causes transactions to be incorrectly
+        // placed in the queued pool (the pool sees a nonce gap that doesn't exist).
+        //
+        // We also use the best known nonce for insert_tx so the tx's initial
+        // TxState flags are calculated against the current state, not the stale one.
+        let effective_on_chain_nonce;
         self.all_transactions
             .sender_info
             .entry(tx.sender_id())
-            .or_default()
-            .update(on_chain_nonce, on_chain_balance);
+            .and_modify(|info| {
+                if on_chain_nonce >= info.state_nonce {
+                    info.update(on_chain_nonce, on_chain_balance);
+                } else {
+                    warn!(
+                        target: "txpool",
+                        sender = %tx.transaction.sender(),
+                        existing_nonce = info.state_nonce,
+                        incoming_nonce = on_chain_nonce,
+                        "rejecting sender_info nonce regression during tx insertion"
+                    );
+                    info.balance = on_chain_balance;
+                }
+            })
+            .or_insert_with(|| SenderInfo {
+                state_nonce: on_chain_nonce,
+                balance: on_chain_balance,
+            });
+        // Use the best known nonce, but never exceed the tx's own nonce — that would
+        // trip the assert in insert_tx. This can happen after a reorg: sender_info may
+        // temporarily hold an inflated nonce from the reverted chain while the tx was
+        // validated against the new (lower) chain state.
+        effective_on_chain_nonce = self
+            .all_transactions
+            .sender_info
+            .get(&tx.sender_id())
+            .map_or(on_chain_nonce, |info| info.state_nonce)
+            .min(tx.transaction.nonce());
 
-        match self.all_transactions.insert_tx(tx, on_chain_balance, on_chain_nonce) {
+        match self.all_transactions.insert_tx(tx, on_chain_balance, effective_on_chain_nonce) {
             Ok(InsertOk { transaction, move_to, replaced_tx, updates, state }) => {
                 // replace the new tx and remove the replaced in the subpool(s)
                 self.add_new_transaction(transaction.clone(), replaced_tx.clone(), move_to);
@@ -3677,7 +3742,7 @@ mod tests {
             id.sender,
             SenderInfo { state_nonce: next.nonce(), balance: U256::from(1_000) },
         );
-        let outcome = pool.update_accounts(changed_senders);
+        let outcome = pool.update_accounts(changed_senders, true);
         assert_eq!(outcome.discarded.len(), 1);
         assert_eq!(pool.pending_pool.len(), 1);
     }
@@ -3854,14 +3919,14 @@ mod tests {
             v0.sender_id(),
             SenderInfo { state_nonce: on_chain_nonce, balance: on_chain_balance },
         );
-        pool.update_accounts(updated_accounts.clone());
+        pool.update_accounts(updated_accounts.clone(), true);
 
         assert_eq!(3, pool.pending_transactions().len());
         assert!(pool.queued_transactions().is_empty());
 
         // Simulate new block arrival - and chain balance decrease.
         updated_accounts.entry(v0.sender_id()).and_modify(|v| v.balance = U256::from(1));
-        pool.update_accounts(updated_accounts);
+        pool.update_accounts(updated_accounts, true);
 
         assert!(pool.pending_transactions().is_empty());
         assert_eq!(3, pool.queued_transactions().len());
@@ -3908,7 +3973,7 @@ mod tests {
             v0.sender_id(),
             SenderInfo { state_nonce: on_chain_nonce, balance: on_chain_balance },
         );
-        pool.update_accounts(updated_accounts);
+        pool.update_accounts(updated_accounts, true);
 
         // 'pending' now).
         assert!(pool.queued_transactions().is_empty());
@@ -4180,7 +4245,7 @@ mod tests {
             v0.sender_id(),
             SenderInfo { state_nonce: on_chain_nonce, balance: on_chain_balance },
         );
-        pool.update_accounts(updated_accounts);
+        pool.update_accounts(updated_accounts, true);
 
         // Transactions are not changed (IMHO - this is a bug, as transaction v2 should be in the
         // 'pending' now).

@@ -539,7 +539,7 @@ where
     pub fn update_accounts(&self, accounts: Vec<ChangedAccount>) {
         let changed_senders = self.changed_senders(accounts.into_iter());
         let UpdateOutcome { promoted, discarded } =
-            self.pool.write().update_accounts(changed_senders);
+            self.pool.write().update_accounts(changed_senders, false);
 
         self.notify_on_transaction_updates(promoted, discarded);
     }
